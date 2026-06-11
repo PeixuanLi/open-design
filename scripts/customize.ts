@@ -334,7 +334,20 @@ function applyDiscordGuards(): void {
 }
 
 function applyStarReplacements(): void {
-  // TODO: filled in by Task 6
+  // Change the repo URL in useGithubStars fetch hook
+  simpleReplace(
+    'apps/web/src/components/useGithubStars.ts',
+    "const REPO = 'https://github.com/nexu-io/open-design'",
+    `const REPO = '${NEW_GITHUB_URL}'`,
+    'Star badge REPO URL',
+  );
+  // Change the href in the badge component
+  simpleReplace(
+    'apps/web/src/components/GithubStarBadge.tsx',
+    'nexu-io/open-design',
+    NEW_GITHUB_LABEL,
+    'Star badge href label',
+  );
 }
 
 // ===== MAIN =====
