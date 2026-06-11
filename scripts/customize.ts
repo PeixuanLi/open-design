@@ -51,6 +51,76 @@ function simpleReplace(file: string, old: string, replacement: string, desc: str
   console.log(`  [OK] ${desc} (${count} occurrence(s))`);
 }
 
+/**
+ * Inject a constant declaration after the last import statement.
+ * Idempotent: checks if the constant already exists.
+ */
+function injectConst(file: string, constName: string, value: string): void {
+  let content: string;
+  try {
+    content = readFileSync(file, 'utf8');
+  } catch {
+    console.warn(`  [WARN] file not found, skipping const inject: ${file}`);
+    return;
+  }
+  if (content.includes(`const ${constName}`)) {
+    return; // already injected
+  }
+  const lines = content.split('\n');
+  let lastImportIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (line.startsWith('import ')) {
+      lastImportIdx = i;
+    }
+  }
+  const insertIdx = lastImportIdx >= 0 ? lastImportIdx + 1 : 0;
+  const injection = `\n// Injected by customize.ts — set to true to re-enable Discord CTAs\nconst ${constName} = ${value};\n`;
+  lines.splice(insertIdx, 0, injection);
+  writeFileSync(file, lines.join('\n'));
+  console.log(`  [OK] injected ${constName} in ${file}`);
+}
+
+/**
+ * Wrap a JSX block with a conditional guard.
+ * Replaces openingAnchor with `{guard && openingAnchor` and
+ * replaces closingAnchor with `closingAnchor}`.
+ * Idempotent: checks if already wrapped.
+ */
+function wrapJsxBlock(
+  file: string,
+  openingAnchor: string,
+  closingAnchor: string,
+  guard: string,
+  desc: string,
+): void {
+  let content: string;
+  try {
+    content = readFileSync(file, 'utf8');
+  } catch {
+    console.warn(`  [WARN] file not found, skipping JSX wrap: ${file}`);
+    return;
+  }
+  if (content.includes(`{${guard} && ${openingAnchor}`)) {
+    return; // already wrapped
+  }
+  if (!content.includes(openingAnchor)) {
+    console.warn(`  [WARN] opening anchor not found in ${file}: "${openingAnchor.substring(0, 60)}..."`);
+    return;
+  }
+  if (!content.includes(closingAnchor)) {
+    console.warn(`  [WARN] closing anchor not found in ${file}: "${closingAnchor.substring(0, 60)}..."`);
+    return;
+  }
+  content = content.replace(openingAnchor, `{${guard} && ${openingAnchor}`);
+  content = content.replace(closingAnchor, `${closingAnchor}}`);
+  writeFileSync(file, content);
+  stats.push({ file, count: 1 });
+  console.log(`  [OK] ${desc}`);
+}
+
+const DISCORD_GUARD = '__OD_DISCORD';
+
 /** Check git porcelain and exit if dirty. */
 function requireCleanTree(): void {
   let out: string;
@@ -189,7 +259,78 @@ function applyUrlReplacements(): void {
 }
 
 function applyDiscordGuards(): void {
-  // TODO: filled in by Task 5
+  // 1. EntryShell.tsx — Discord badge in top bar
+  injectConst('apps/web/src/components/EntryShell.tsx', DISCORD_GUARD, 'false');
+  wrapJsxBlock(
+    'apps/web/src/components/EntryShell.tsx',
+    '<a\n                className="entry-discord-badge"',
+    '</a>\n              {executionSwitcher}',
+    DISCORD_GUARD,
+    'EntryShell Discord badge',
+  );
+
+  // 2. EntrySettingsMenu.tsx — Discord menu item
+  injectConst('apps/web/src/components/EntrySettingsMenu.tsx', DISCORD_GUARD, 'false');
+  wrapJsxBlock(
+    'apps/web/src/components/EntrySettingsMenu.tsx',
+    '<a\n            className="entry-settings-menu__item"\n            href={DISCORD_URL}',
+    '<Icon name="external-link" size={12} className="entry-settings-menu__item-end" />\n          </a>',
+    DISCORD_GUARD,
+    'EntrySettingsMenu Discord item',
+  );
+
+  // 3. EntryHelpMenu.tsx — Discord help menu item
+  injectConst('apps/web/src/components/EntryHelpMenu.tsx', DISCORD_GUARD, 'false');
+  wrapJsxBlock(
+    'apps/web/src/components/EntryHelpMenu.tsx',
+    '<a\n            className="entry-help-popover__item"\n            href={DISCORD_URL}',
+    '<span>{t(\'entry.discordLabel\')}</span>\n          </a>',
+    DISCORD_GUARD,
+    'EntryHelpMenu Discord item',
+  );
+
+  // 4. AssistantMessage.tsx — Discord feedback CTAs (two <p> blocks)
+  injectConst('apps/web/src/components/AssistantMessage.tsx', DISCORD_GUARD, 'false');
+  let amContent: string;
+  try {
+    amContent = readFileSync('apps/web/src/components/AssistantMessage.tsx', 'utf8');
+  } catch {
+    console.warn('  [WARN] file not found: AssistantMessage.tsx');
+    return;
+  }
+  // Idempotent: skip if already guarded.
+  if (amContent.includes(`{${DISCORD_GUARD} ? <p className="assistant-feedback-discord-note">`)) {
+    return;
+  }
+  // Replace opening tag with ternary guard
+  const replaced = amContent.replaceAll(
+    '<p className="assistant-feedback-discord-note">',
+    `{${DISCORD_GUARD} ? <p className="assistant-feedback-discord-note">`,
+  );
+  // Replace closing </p> for both the positive and negative feedback branches.
+  const updated = replaced
+    .replace(
+      'Discord</a>{" "}community, or drop a screenshot and tell us what worked well.\n            </p>',
+      'Discord</a>{" "}community, or drop a screenshot and tell us what worked well.\n            </p> : null}',
+    )
+    .replace(
+      'Discord</a>{" "}so the team can understand what went wrong and follow up directly.\n            </p>',
+      'Discord</a>{" "}so the team can understand what went wrong and follow up directly.\n            </p> : null}',
+    );
+  if (updated !== amContent) {
+    writeFileSync('apps/web/src/components/AssistantMessage.tsx', updated);
+    stats.push({ file: 'apps/web/src/components/AssistantMessage.tsx', count: 1 });
+    console.log('  [OK] AssistantMessage Discord CTAs');
+  }
+
+  // 5. useDiscordPresence.ts — early return in hook
+  injectConst('apps/web/src/components/useDiscordPresence.ts', DISCORD_GUARD, 'false');
+  simpleReplace(
+    'apps/web/src/components/useDiscordPresence.ts',
+    'export function useDiscordPresence(): CachedPresence | null {\n  const [presence, setPresence]',
+    `export function useDiscordPresence(): CachedPresence | null {\n  if (!${DISCORD_GUARD}) return null;\n  const [presence, setPresence]`,
+    'useDiscordPresence early return',
+  );
 }
 
 function applyStarReplacements(): void {
