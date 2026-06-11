@@ -71,7 +71,82 @@ function requireCleanTree(): void {
 // ===== REPLACEMENT FUNCTIONS (filled in by Tasks 3-6) =====
 
 function applyNameReplacements(): void {
-  // TODO: filled in by Task 3
+  // Locale files directory
+  const LOCALES_DIR = 'apps/web/src/i18n/locales';
+  const LOCALES = [
+    'ar', 'de', 'en', 'es-ES', 'fa', 'fr', 'hu', 'id', 'it',
+    'ja', 'ko', 'pl', 'pt-BR', 'ru', 'th', 'tr', 'uk', 'zh-CN', 'zh-TW',
+  ].map(l => `${LOCALES_DIR}/${l}.ts`);
+
+  // --- tools/pack constants ---
+  simpleReplace('tools/pack/src/mac/constants.ts',
+    'Open Design', NEW_BRAND, 'mac PRODUCT_NAME');
+  simpleReplace('tools/pack/src/win/constants.ts',
+    'Open Design', NEW_BRAND, 'win PRODUCT_NAME');
+
+  // linux.ts has multiple occurrences
+  const linuxFile = 'tools/pack/src/linux.ts';
+  simpleReplace(linuxFile, 'Open Design', NEW_BRAND, 'linux PRODUCT_NAME var');
+  simpleReplace(linuxFile, 'Open-Design', NEW_KEBAB, 'linux APP_IMAGE_PRODUCT_NAME');
+  simpleReplace(linuxFile, 'Open Design Team', `${NEW_BRAND} Team`, 'linux author');
+  simpleReplace(linuxFile, 'Open Design Contributors', `${NEW_BRAND} Contributors`, 'linux maintainer');
+  simpleReplace(linuxFile, 'Open Design headless launcher', `${NEW_BRAND} headless launcher`, 'linux headless comment');
+
+  // --- i18n locales (19 files x 3 keys) ---
+  for (const locale of LOCALES) {
+    simpleReplace(locale, "'Open Design'", `'${NEW_BRAND}'`, `i18n app.brand`);
+    simpleReplace(locale, "'Research Preview'", `'${NEW_BRAND_PILL}'`, `i18n app.brandPill`);
+    simpleReplace(locale, "'by Nexu Labs'", `'${NEW_BRAND_SUBTITLE}'`, `i18n app.brandSubtitle`);
+  }
+
+  // --- Prompt files (contracts + daemon mirror — keep in sync) ---
+  const promptPairs = [
+    { contract: 'packages/contracts/src/prompts/discovery.ts', daemon: 'apps/daemon/src/prompts/discovery.ts' },
+    { contract: 'packages/contracts/src/prompts/system.ts', daemon: 'apps/daemon/src/prompts/system.ts' },
+    { contract: 'packages/contracts/src/prompts/official-system.ts', daemon: 'apps/daemon/src/prompts/official-system.ts' },
+  ];
+
+  for (const { contract, daemon } of promptPairs) {
+    simpleReplace(contract, 'Open Design workflow', `${NEW_BRAND} workflow`, `prompt discovery contract`);
+    simpleReplace(daemon, 'Open Design workflow', `${NEW_BRAND} workflow`, `prompt discovery daemon`);
+    simpleReplace(contract, 'The Open Design UI locale', `The ${NEW_BRAND} UI locale`, `prompt system contract`);
+    simpleReplace(daemon, 'The Open Design UI locale', `The ${NEW_BRAND} UI locale`, `prompt system daemon`);
+    simpleReplace(contract, 'Open Design app chrome', `${NEW_BRAND} app chrome`, `prompt official-system contract`);
+    simpleReplace(daemon, 'Open Design app chrome', `${NEW_BRAND} app chrome`, `prompt official-system daemon`);
+    simpleReplace(contract, 'The base system prompt for Open Design',
+      `The base system prompt for ${NEW_BRAND}`, `prompt official-system contract doc`);
+    simpleReplace(daemon, 'The base system prompt for Open Design',
+      `The base system prompt for ${NEW_BRAND}`, `prompt official-system daemon doc`);
+  }
+
+  // system.ts has additional occurrences (chat mode, description, workflow)
+  for (const sysFile of ['packages/contracts/src/prompts/system.ts', 'apps/daemon/src/prompts/system.ts']) {
+    simpleReplace(sysFile, 'Open Design Chat mode', `${NEW_BRAND} Chat mode`, `prompt system chat mode`);
+    simpleReplace(sysFile, 'Open Design is the open-source', `${NEW_BRAND} is the open-source`, `prompt system desc`);
+    simpleReplace(sysFile, 'Open Design agent workflow', `${NEW_BRAND} agent workflow`, `prompt system workflow`);
+    simpleReplace(sysFile, 'Open Design-owned media', `${NEW_BRAND}-owned media`, `prompt system media note`);
+    simpleReplace(sysFile, 'normal Open Design agent workflow',
+      `normal ${NEW_BRAND} agent workflow`, `prompt system normal workflow`);
+    simpleReplace(sysFile, 'Open Design. Official links', `${NEW_BRAND}. Official links`, `prompt system links`);
+  }
+
+  // --- Web app ---
+  simpleReplace('apps/web/app/layout.tsx', "title: 'Open Design'", `title: '${NEW_BRAND}'`, 'web layout title');
+  simpleReplace('packages/contracts/src/api/social-share.ts',
+    'Built with Open Design', `Built with ${NEW_BRAND}`, 'social-share built-with');
+  simpleReplace('packages/contracts/src/api/social-share.ts',
+    "'Open Design project'", `'${NEW_BRAND} project'`, 'social-share fallback title 1');
+  simpleReplace('packages/contracts/src/api/social-share.ts',
+    "Open Design'", `${NEW_BRAND}'`, 'social-share fallback title 2');
+  simpleReplace('packages/contracts/src/api/social-share.ts',
+    'Open Design is an open-source workspace', `${NEW_BRAND} is an open-source workspace`, 'social-share og desc');
+  simpleReplace('packages/contracts/src/api/social-share.ts',
+    'Open Design repo:', `${NEW_BRAND} repo:`, 'social-share repo label');
+
+  // --- tools/dev ---
+  simpleReplace('tools/dev/src/index.ts', 'Open Design dev server', `${NEW_BRAND} dev server`, 'tools-dev start banner');
+  simpleReplace('tools/dev/src/index.ts', 'Stopping Open Design dev server',
+    `Stopping ${NEW_BRAND} dev server`, 'tools-dev stop banner');
 }
 
 function applyUrlReplacements(): void {
