@@ -150,7 +150,42 @@ function applyNameReplacements(): void {
 }
 
 function applyUrlReplacements(): void {
-  // TODO: filled in by Task 4
+  // --- Full GitHub URL ---
+  const fullUrlFiles = [
+    'packages/contracts/src/api/social-share.ts',
+    'apps/web/src/runtime/plugin-source.ts',
+    'apps/web/src/components/useGithubStars.ts',
+    'apps/web/src/components/EntryHelpMenu.tsx',
+    'apps/web/src/components/DesignFilesPanel.tsx',
+    'apps/desktop/src/main/index.ts',
+  ];
+  for (const f of fullUrlFiles) {
+    simpleReplace(f, 'https://github.com/nexu-io/open-design', NEW_GITHUB_URL, `github url ${f}`);
+  }
+
+  // --- GitHub API URL ---
+  simpleReplace('apps/daemon/src/server.ts',
+    'https://api.github.com/repos/nexu-io/open-design', NEW_GITHUB_API, 'github api url');
+
+  // --- Short label nexu-io/open-design ---
+  const labelFiles = [
+    'apps/daemon/src/server.ts',
+    'apps/daemon/src/cli.ts',
+    'apps/daemon/src/plugins/publish.ts',
+    'apps/daemon/src/plugins/marketplaces.ts',
+    'apps/daemon/src/runtimes/metadata.ts',
+    'apps/daemon/src/legacy-data-migrator.ts',
+    'apps/daemon/src/import-export-routes.ts',
+    'apps/daemon/src/inline-assets.ts',
+    'apps/daemon/src/qa/cta-hierarchy.ts',
+    'apps/daemon/src/prompts/system.ts',
+    'apps/web/src/runtime/plugin-source.ts',
+    'apps/web/src/components/GithubStarBadge.tsx',
+    'apps/desktop/src/main/index.ts',
+  ];
+  for (const f of labelFiles) {
+    simpleReplace(f, 'nexu-io/open-design', NEW_GITHUB_LABEL, `github label ${f}`);
+  }
 }
 
 function applyDiscordGuards(): void {
