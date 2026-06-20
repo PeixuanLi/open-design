@@ -153,6 +153,17 @@ function resolveChromeActionsHost(): HTMLElement | null {
     ?? document.getElementById(APP_CHROME_FILE_ACTIONS_ID);
 }
 
+// Pull the file path out of a daemon raw URL the route bridge reports, e.g.
+// `/api/projects/<id>/raw/board.html` -> `board.html`. Returns undefined for
+// anything that does not look like a project raw path so the caller can treat
+// the route as same-file / hash-only and skip the cross-file switch.
+function parseFileFromRawPath(pathname: string): string | undefined {
+  const match = /\/api\/projects\/[^/]+\/raw\/(.+)$/.exec(pathname);
+  if (!match || !match[1]) return undefined;
+  const raw = match[1];
+  try { return decodeURIComponent(raw); } catch { return raw; }
+}
+
 type TranslateFn = (key: keyof Dict, vars?: Record<string, string | number>) => string;
 type SlideState = { active: number; count: number };
 type BoardTool = 'inspect' | 'pod';
@@ -165,6 +176,26 @@ export type ManualEditPendingStyleSave = {
 };
 type PreviewViewportId = 'desktop' | 'tablet' | 'mobile';
 type PreviewCanvasSize = { width: number; height: number; scrollLeft?: number; scrollTop?: number };
+// Last known sub-page route reported by the URL-load iframe's route bridge.
+// Carries the resolved file name (parsed from the daemon raw URL path) so the
+// host can detect cross-file navigation (e.g. index.html -> board.html) even
+// though the URL-load iframe is cross-origin and `iframe.contentWindow.location`
+// is unreadable from the host.
+type PreviewRouteSnapshot = {
+  href: string;
+  file?: string;
+  hash?: string;
+  search?: string;
+};
+// A pending annotation/edit activation that was deferred until the workspace
+// swaps the active file to the sub-page the URL-load iframe was actually
+// showing. `kind` tells the file.name effect which activation to run once
+// `file.name === pending.file` (issue #2143 covers edit; comment / mark /
+// comments share the same flip-to-srcDoc reset, same fix).
+type PendingAnnotationActivation = {
+  file: string;
+  kind: 'comment' | 'commentCreate' | 'draw' | 'edit';
+};
 type CommentPreviewCanvasOptions = {
   boardMode: boolean;
   sidePanelCollapsed: boolean;
@@ -956,6 +987,11 @@ interface Props {
   // atomic tab-state update. The React module pointer uses this to jump to the
   // HTML entry that renders a module and drop the dead-end module tab.
   onOpenFileReplacing?: (openName: string, closeName: string) => void;
+  // Switch the active file tab to `name` without closing anything. Used by
+  // the manual edit activation path to follow the user into a sub-page they
+  // reached via an in-iframe link (e.g. index.html -> board.html), so the
+  // srcDoc rebuild lands on the page they were actually viewing (issue #2143).
+  onSwitchFile?: (name: string) => void;
   commentPortalId?: string;
   onCommentModeChange?: (active: boolean) => void;
   // Bumped nonce asking this viewer to open its Share/Export menu (chat-side
@@ -986,6 +1022,7 @@ export function FileViewer({
   onSendBoardCommentAttachments,
   onFileSaved,
   onOpenFileReplacing,
+  onSwitchFile,
   commentPortalId,
   onCommentModeChange,
   shareRequest,
@@ -1035,6 +1072,7 @@ export function FileViewer({
         shareRequest={shareRequest}
         downloadRequest={downloadRequest}
         slideNavRequest={slideNavRequest}
+        onSwitchFile={onSwitchFile}
       />
     );
   }
@@ -4433,6 +4471,7 @@ function HtmlViewer({
   shareRequest,
   downloadRequest,
   slideNavRequest,
+  onSwitchFile,
 }: {
   projectId: string;
   projectKind: TrackingProjectKind;
@@ -4454,6 +4493,7 @@ function HtmlViewer({
   shareRequest?: { nonce: number } | null;
   downloadRequest?: { nonce: number } | null;
   slideNavRequest?: { slideIndex: number; nonce: number } | null;
+  onSwitchFile?: (name: string) => void;
 }) {
   const { locale, t } = useI18n();
   const analytics = useAnalytics();
@@ -5298,6 +5338,8 @@ function HtmlViewer({
     [source],
   );
   const [urlSelectionBridgeReady, setUrlSelectionBridgeReady] = useState(false);
+  const lastPreviewRouteRef = useRef<PreviewRouteSnapshot | null>(null);
+  const pendingAnnotationActivationRef = useRef<PendingAnnotationActivation | null>(null);
   const urlLoadDecision: UrlLoadDecision = {
     mode,
     isDeck: effectiveDeck,
@@ -5312,7 +5354,7 @@ function HtmlViewer({
   };
   const useUrlLoadPreview = shouldUrlLoadHtmlPreview(urlLoadDecision) && !manualEditRequiresSrcDoc;
   const basePreviewSrcUrl = useMemo(
-    () => `${projectRawUrl(projectId, file.name)}?v=${Math.round(file.mtime)}&r=${reloadKey}&odPreviewBridge=scroll&odPreviewBridge=selection&odPreviewBridge=snapshot`,
+    () => `${projectRawUrl(projectId, file.name)}?v=${Math.round(file.mtime)}&r=${reloadKey}&odPreviewBridge=scroll&odPreviewBridge=selection&odPreviewBridge=snapshot&odPreviewBridge=route`,
     [projectId, file.name, file.mtime, reloadKey],
   );
   const [previewSrcUrl, setPreviewSrcUrl] = useState(basePreviewSrcUrl);
@@ -5359,6 +5401,30 @@ function HtmlViewer({
     setCommentCreateMode(false);
     setActivePreviewCommentId(null);
   }, [projectId, file.name]);
+  // Drop the cached sub-page route on file/project switch so a stale report
+  // from the previous artifact (e.g. an old `board.html` link on index.html)
+  // cannot leak into the next file's edit activation. The freshly mounted
+  // URL-load iframe's route bridge repopulates this on its first report.
+  useEffect(() => {
+    lastPreviewRouteRef.current = null;
+  }, [projectId, file.name]);
+  // When the user clicked an annotation/edit tool on a cross-file sub-page
+  // (e.g. board.html reached via an in-iframe link from index.html), the
+  // activate handler asked the workspace to swap the active file to that
+  // sub-page. Once the swap lands here, finish activating the requested mode
+  // on the now-current file so srcDoc rebuilds from the sub-page the user was
+  // actually viewing (issue #2143 for edit; same root cause + fix for
+  // comment / mark / comments).
+  useEffect(() => {
+    const pending = pendingAnnotationActivationRef.current;
+    if (!pending || pending.file !== file.name) return;
+    pendingAnnotationActivationRef.current = null;
+    if (pending.kind === 'edit') performManualEditActivation();
+    else if (pending.kind === 'comment') performCommentActivation();
+    else if (pending.kind === 'commentCreate') performCommentCreateActivation();
+    else if (pending.kind === 'draw') performDrawActivation();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [file.name]);
   const activePreviewSrcUrl = (
     previewSrcUrl === effectiveBasePreviewSrcUrl ||
     previewSrcUrl.startsWith(`${effectiveBasePreviewSrcUrl}&`)
@@ -5467,6 +5533,36 @@ function HtmlViewer({
       const data = ev.data as { type?: string } | null;
       if (data?.type !== 'od:url-selection-bridge-ready') return;
       setUrlSelectionBridgeReady(true);
+    }
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, []);
+  // Track sub-page navigations inside the URL-load iframe. The iframe is
+  // sandboxed without `allow-same-origin`, so the host cannot read its
+  // `contentWindow.location` directly; the daemon-injected route bridge
+  // reports the live location (and anchor clicks before they navigate) so
+  // we can recover the user's actual position when an annotation/edit tool
+  // forces a transport flip to srcDoc (issue #2143).
+  useEffect(() => {
+    function onMessage(ev: MessageEvent) {
+      const frame = urlPreviewIframeRef.current;
+      if (ev.source !== frame?.contentWindow) return;
+      if (frame.getAttribute('src') === 'about:blank') return;
+      const data = ev.data as
+        | { type?: string; href?: string; path?: string; hash?: string; search?: string }
+        | null;
+      if (!data || data.type !== 'od:preview-route') return;
+      const href = typeof data.href === 'string' ? data.href : '';
+      if (!href) return;
+      const file = typeof data.path === 'string' && data.path
+        ? parseFileFromRawPath(data.path)
+        : undefined;
+      lastPreviewRouteRef.current = {
+        href,
+        file,
+        hash: typeof data.hash === 'string' ? data.hash : undefined,
+        search: typeof data.search === 'string' ? data.search : undefined,
+      };
     }
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
@@ -5590,6 +5686,35 @@ function HtmlViewer({
   useEffect(() => {
     restorePreviewScrollPosition();
   }, [boardMode, drawOverlayOpen, manualEditMode, srcDoc, restorePreviewScrollPosition]);
+
+  // Replay a saved hash SPA route onto the freshly built srcDoc iframe
+  // whenever srcDoc is the active transport (manual edit, draw, inspect, or
+  // comment/commentCreate when the URL selection bridge is not ready). The
+  // cross-file case is handled by switching the active file first, so by the
+  // time this runs file.name already matches route.file. Mirrors the URL-load
+  // route bridge's restore channel so the host does not need to care which
+  // transport the iframe is on (issue #2143 for edit; comment / mark /
+  // comments share the same flip-to-srcDoc reset and the same fix).
+  useEffect(() => {
+    if (useUrlLoadPreview) return;
+    const route = lastPreviewRouteRef.current;
+    if (!route?.hash) return;
+    if (route.file && route.file !== file.name) return;
+    const hash = route.hash;
+    const send = () => {
+      const win = iframeRef.current?.contentWindow;
+      if (!win) return;
+      win.postMessage({ type: 'od:preview-route-restore', hash }, '*');
+    };
+    const raf = window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        send();
+        window.setTimeout(send, 120);
+      });
+    });
+    return () => window.cancelAnimationFrame(raf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [useUrlLoadPreview, file.name, srcDoc]);
 
   useEffect(() => {
     function onMessage(ev: MessageEvent) {
@@ -7189,6 +7314,78 @@ function HtmlViewer({
     setAgentToolsOpen(false);
   }
 
+  // Core activation bodies for each annotation/edit tool. Extracted so the
+  // immediate path and the cross-file-deferred path (pending effect) share
+  // one implementation — two callers would drift, and the deferred path
+  // needs the exact same state transitions to land in the same order.
+  function performDrawActivation() {
+    setCommentPanelOpen(false);
+    setCommentCreateMode(false);
+    setBoardMode(false);
+    clearBoardComposer();
+    setInspectMode(false);
+    setMode('preview');
+    setDrawOverlayOpen(true);
+    closeArtifactToolMenus();
+  }
+
+  function performCommentActivation() {
+    setCommentPanelOpen(false);
+    setCommentCreateMode(false);
+    clearBoardComposer();
+    setInspectMode(false);
+    setDrawOverlayOpen(false);
+    setMode('preview');
+    activateBoard('inspect');
+    closeArtifactToolMenus();
+  }
+
+  function performCommentCreateActivation() {
+    setCommentPanelOpen(true);
+    setCommentSidePanelCollapsed(false);
+    setCommentCreateMode(true);
+    if (!activeCommentTarget) clearBoardComposer();
+    setInspectMode(false);
+    setDrawOverlayOpen(false);
+    setMode('preview');
+    activateBoard('inspect');
+    closeArtifactToolMenus();
+  }
+
+  function performManualEditActivation() {
+    setCommentPanelOpen(false);
+    setCommentCreateMode(false);
+    setBoardMode(false);
+    clearBoardComposer();
+    setInspectMode(false);
+    setDrawOverlayOpen(false);
+    setMode('preview');
+    setManualEditViewportWidth(previewBodyRef.current?.clientWidth ?? null);
+    setManualEditSrcDocActive(true);
+    setManualEditMode(true);
+    closeArtifactToolMenus();
+  }
+
+  // If the URL-load iframe has navigated to a different sub-page than the
+  // active file tab (e.g. index.html -> board.html via an in-iframe link),
+  // flipping transport to srcDoc now would rebuild from `file.name`'s source
+  // and reset the preview to the wrong page. Defer the activation until the
+  // workspace swaps the active file to the route's file; the file.name effect
+  // above finishes the activation once the swap lands (issue #2143 for edit;
+  // comment / mark / comments share the same flip-to-srcDoc reset, same fix).
+  // Returns true when activation was deferred and the caller must not also
+  // activate synchronously.
+  function maybeDeferAnnotationForRoute(kind: PendingAnnotationActivation['kind']): boolean {
+    const route = lastPreviewRouteRef.current;
+    if (!route?.file) return false;
+    if (route.file === file.name) return false;
+    if (typeof onSwitchFile !== 'function') return false;
+    pendingAnnotationActivationRef.current = { file: route.file, kind };
+    onSwitchFile(route.file);
+    closeArtifactToolMenus();
+    return true;
+  }
+
   function activateDrawTool() {
     fireArtifactToolbarClick('mark');
     const next = !drawOverlayOpen;
@@ -7198,23 +7395,16 @@ function HtmlViewer({
       return;
     }
     capturePreviewScrollPosition();
-    const activateDraw = () => {
-      setCommentPanelOpen(false);
-      setCommentCreateMode(false);
-      setBoardMode(false);
-      clearBoardComposer();
-      setInspectMode(false);
-      setMode('preview');
-      setDrawOverlayOpen(true);
-      closeArtifactToolMenus();
-    };
     if (manualEditMode) {
       void exitManualEditModeAfterFlush().then((ok) => {
-        if (ok) activateDraw();
+        if (!ok) return;
+        if (maybeDeferAnnotationForRoute('draw')) return;
+        performDrawActivation();
       });
       return;
     }
-    activateDraw();
+    if (maybeDeferAnnotationForRoute('draw')) return;
+    performDrawActivation();
   }
 
   function activateCommentTool() {
@@ -7227,23 +7417,16 @@ function HtmlViewer({
       setAgentToolsOpen(false);
       return;
     }
-    const activateComment = () => {
-      setCommentPanelOpen(false);
-      setCommentCreateMode(false);
-      clearBoardComposer();
-      setInspectMode(false);
-      setDrawOverlayOpen(false);
-      setMode('preview');
-      activateBoard('inspect');
-      closeArtifactToolMenus();
-    };
     if (manualEditMode) {
       void exitManualEditModeAfterFlush().then((ok) => {
-        if (ok) activateComment();
+        if (!ok) return;
+        if (maybeDeferAnnotationForRoute('comment')) return;
+        performCommentActivation();
       });
       return;
     }
-    activateComment();
+    if (maybeDeferAnnotationForRoute('comment')) return;
+    performCommentActivation();
   }
 
   function activateCommentCreateTool() {
@@ -7257,41 +7440,24 @@ function HtmlViewer({
       closeArtifactToolMenus();
       return;
     }
-    const activateCommentCreate = () => {
-      setCommentPanelOpen(true);
-      setCommentSidePanelCollapsed(false);
-      setCommentCreateMode(true);
-      if (!activeCommentTarget) clearBoardComposer();
-      setInspectMode(false);
-      setDrawOverlayOpen(false);
-      setMode('preview');
-      activateBoard('inspect');
-      closeArtifactToolMenus();
-    };
     if (manualEditMode) {
       void exitManualEditModeAfterFlush().then((ok) => {
-        if (ok) activateCommentCreate();
+        if (!ok) return;
+        if (maybeDeferAnnotationForRoute('commentCreate')) return;
+        performCommentCreateActivation();
       });
       return;
     }
-    activateCommentCreate();
+    if (maybeDeferAnnotationForRoute('commentCreate')) return;
+    performCommentCreateActivation();
   }
 
   function activateManualEditTool() {
     fireArtifactToolbarClick('edit');
     capturePreviewScrollPosition();
     if (!manualEditMode) {
-      setCommentPanelOpen(false);
-      setCommentCreateMode(false);
-      setBoardMode(false);
-      clearBoardComposer();
-      setInspectMode(false);
-      setDrawOverlayOpen(false);
-      setMode('preview');
-      setManualEditViewportWidth(previewBodyRef.current?.clientWidth ?? null);
-      setManualEditSrcDocActive(true);
-      setManualEditMode(true);
-      closeArtifactToolMenus();
+      if (maybeDeferAnnotationForRoute('edit')) return;
+      performManualEditActivation();
       return;
     }
     closeArtifactToolMenus();

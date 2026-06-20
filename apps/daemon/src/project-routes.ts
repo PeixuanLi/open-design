@@ -720,6 +720,76 @@ const URL_PREVIEW_SNAPSHOT_BRIDGE = `<script data-od-url-snapshot-bridge>
 })();
 </script>`;
 
+const URL_PREVIEW_ROUTE_BRIDGE = `<script data-od-url-route-bridge>
+(function(){
+  if (window.__odUrlRouteBridge) return;
+  window.__odUrlRouteBridge = true;
+  function buildPayload(targetUrl){
+    try {
+      var url = targetUrl ? new URL(targetUrl, location.href) : location;
+      return {
+        href: typeof url === 'string' ? url : url.href,
+        path: typeof url === 'string' ? '' : url.pathname,
+        hash: typeof url === 'string' ? '' : url.hash,
+        search: typeof url === 'string' ? '' : url.search
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+  function report(targetUrl){
+    var payload = buildPayload(targetUrl);
+    if (!payload) return;
+    try {
+      window.parent.postMessage(Object.assign({ type: 'od:preview-route' }, payload), '*');
+    } catch (_) {}
+  }
+  function reportCurrent(){ report(null); }
+  window.addEventListener('hashchange', reportCurrent);
+  window.addEventListener('popstate', reportCurrent);
+  ['pushState','replaceState'].forEach(function(m){
+    var orig = history[m];
+    if (typeof orig !== 'function') return;
+    history[m] = function(){
+      try { orig.apply(this, arguments); } catch (e) { orig.apply(this, arguments); throw e; }
+      reportCurrent();
+    };
+  });
+  function resolveAnchorTarget(el){
+    if (!el || typeof el.closest !== 'function') return null;
+    var a = el.closest('a[href]');
+    if (!a) return null;
+    var href = a.getAttribute('href');
+    if (!href) return null;
+    if (href.charAt(0) === '#') return null;
+    if (/^(?:javascript:|mailto:|tel:|data:)/i.test(href)) return null;
+    if (a.target === '_blank' || a.target === '_top') return null;
+    return href;
+  }
+  document.addEventListener('click', function(ev){
+    var target = ev && ev.target;
+    var href = resolveAnchorTarget(target);
+    if (!href) return;
+    report(href);
+  }, true);
+  window.addEventListener('message', function(ev){
+    var data = ev && ev.data;
+    if (!data || data.type !== 'od:preview-route-restore') return;
+    try {
+      if (typeof data.hash === 'string' && data.hash && location.hash !== data.hash) {
+        location.hash = data.hash;
+      }
+    } catch (_) {}
+  });
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', reportCurrent, { once: true });
+  } else {
+    setTimeout(reportCurrent, 0);
+  }
+  window.parent.postMessage({ type: 'od:url-route-bridge-ready' }, '*');
+})();
+</script>`;
+
 function previewBridgeTokens(value: unknown): string[] {
   if (Array.isArray(value)) return value.flatMap(previewBridgeTokens);
   if (typeof value !== 'string') return [];
@@ -738,6 +808,10 @@ function wantsUrlPreviewSnapshotBridge(value: unknown): boolean {
   return previewBridgeTokens(value).some((token) => token === 'snapshot' || token === 'image' || token === 'capture');
 }
 
+function wantsUrlPreviewRouteBridge(value: unknown): boolean {
+  return previewBridgeTokens(value).some((token) => token === 'route' || token === 'router' || token === 'navigation');
+}
+
 function injectBeforeBodyClose(html: string, marker: string, injection: string): string {
   if (html.includes(marker)) return html;
   const bodyCloseIndex = html.search(/<\/body\s*>/i);
@@ -747,12 +821,15 @@ function injectBeforeBodyClose(html: string, marker: string, injection: string):
   return `${html}${injection}`;
 }
 
-function injectUrlPreviewBridge(html: string, bridge: 'scroll' | 'selection' | 'snapshot'): string {
+function injectUrlPreviewBridge(html: string, bridge: 'scroll' | 'selection' | 'snapshot' | 'route'): string {
   if (bridge === 'scroll') {
     return injectBeforeBodyClose(html, 'data-od-url-scroll-bridge', URL_PREVIEW_SCROLL_BRIDGE);
   }
   if (bridge === 'selection') {
     return injectBeforeBodyClose(html, 'data-od-url-selection-bridge', URL_PREVIEW_SELECTION_BRIDGE);
+  }
+  if (bridge === 'route') {
+    return injectBeforeBodyClose(html, 'data-od-url-route-bridge', URL_PREVIEW_ROUTE_BRIDGE);
   }
   return injectBeforeBodyClose(html, 'data-od-url-snapshot-bridge', URL_PREVIEW_SNAPSHOT_BRIDGE);
 }
@@ -2360,7 +2437,8 @@ export function registerProjectFileRoutes(app: Express, ctx: RegisterProjectFile
           if (
             (wantsUrlPreviewScrollBridge(req.query.odPreviewBridge) ||
               wantsUrlPreviewSelectionBridge(req.query.odPreviewBridge) ||
-              wantsUrlPreviewSnapshotBridge(req.query.odPreviewBridge)) &&
+              wantsUrlPreviewSnapshotBridge(req.query.odPreviewBridge) ||
+              wantsUrlPreviewRouteBridge(req.query.odPreviewBridge)) &&
             /^text\/html(?:;|$)/i.test(file.mime)
           ) {
             let html = Buffer.isBuffer(transformed) ? transformed.toString('utf8') : transformed;
@@ -2372,6 +2450,9 @@ export function registerProjectFileRoutes(app: Express, ctx: RegisterProjectFile
             }
             if (wantsUrlPreviewSnapshotBridge(req.query.odPreviewBridge)) {
               html = injectUrlPreviewBridge(html, 'snapshot');
+            }
+            if (wantsUrlPreviewRouteBridge(req.query.odPreviewBridge)) {
+              html = injectUrlPreviewBridge(html, 'route');
             }
             transformed = html;
           }
