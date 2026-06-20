@@ -80,7 +80,28 @@ export function buildSrcdoc(
   // it to a per-call option would force iframe srcdoc regeneration (and a
   // visible flash) every time the host toggle flips.
   const withTweaks = injectTweaksBridge(withEdit);
-  return injectSrcdocTransportActivationBridge(injectSnapshotBridge(withTweaks));
+  return injectSrcdocTransportActivationBridge(injectRouteRestoreBridge(injectSnapshotBridge(withTweaks)));
+}
+
+// Lets the host replay a saved hash route onto a freshly rebuilt srcDoc iframe.
+function injectRouteRestoreBridge(doc: string): string {
+  if (doc.includes('data-od-route-restore-bridge')) return doc;
+  const payload = `<script data-od-route-restore-bridge>
+(function(){
+  if (window.__odRouteRestoreBridge) return;
+  window.__odRouteRestoreBridge = true;
+  window.addEventListener('message', function(ev){
+    var data = ev && ev.data;
+    if (!data || data.type !== 'od:preview-route-restore') return;
+    try {
+      if (typeof data.hash === 'string' && data.hash && location.hash !== data.hash) {
+        location.hash = data.hash;
+      }
+    } catch (_) {}
+  });
+})();
+</script>`;
+  return injectBeforeBodyEnd(doc, payload);
 }
 
 /**

@@ -2253,6 +2253,7 @@ export function FileWorkspace({
             onSendBoardCommentAttachments={onSendBoardCommentAttachments}
             onFileSaved={onRefreshFiles}
             onOpenFileReplacing={openFileReplacing}
+            onSwitchFile={openFile}
             commentPortalId={commentPortalId}
             onCommentModeChange={onCommentModeChange}
             shareRequest={

@@ -153,6 +153,13 @@ function resolveChromeActionsHost(): HTMLElement | null {
     ?? document.getElementById(APP_CHROME_FILE_ACTIONS_ID);
 }
 
+function parseFileFromRawPath(pathname: string): string | undefined {
+  const match = /\/api\/projects\/[^/]+\/raw\/(.+)$/.exec(pathname);
+  if (!match || !match[1]) return undefined;
+  const raw = match[1];
+  try { return decodeURIComponent(raw); } catch { return raw; }
+}
+
 type TranslateFn = (key: keyof Dict, vars?: Record<string, string | number>) => string;
 type SlideState = { active: number; count: number };
 type BoardTool = 'inspect' | 'pod';
@@ -165,6 +172,20 @@ export type ManualEditPendingStyleSave = {
 };
 type PreviewViewportId = 'desktop' | 'tablet' | 'mobile';
 type PreviewCanvasSize = { width: number; height: number; scrollLeft?: number; scrollTop?: number };
+// The URL-load iframe is cross-origin, so the host can't read its location.
+// The daemon route bridge reports it instead.
+type PreviewRouteSnapshot = {
+  href: string;
+  file?: string;
+  hash?: string;
+  search?: string;
+};
+// Activation deferred until the workspace swaps to a different file, so the
+// srcDoc rebuild lands on the page the iframe was actually showing.
+type PendingAnnotationActivation = {
+  file: string;
+  kind: 'comment' | 'commentCreate' | 'draw' | 'edit';
+};
 type CommentPreviewCanvasOptions = {
   boardMode: boolean;
   sidePanelCollapsed: boolean;
@@ -956,6 +977,7 @@ interface Props {
   // atomic tab-state update. The React module pointer uses this to jump to the
   // HTML entry that renders a module and drop the dead-end module tab.
   onOpenFileReplacing?: (openName: string, closeName: string) => void;
+  onSwitchFile?: (name: string) => void;
   commentPortalId?: string;
   onCommentModeChange?: (active: boolean) => void;
   // Bumped nonce asking this viewer to open its Share/Export menu (chat-side
@@ -986,6 +1008,7 @@ export function FileViewer({
   onSendBoardCommentAttachments,
   onFileSaved,
   onOpenFileReplacing,
+  onSwitchFile,
   commentPortalId,
   onCommentModeChange,
   shareRequest,
@@ -1035,6 +1058,7 @@ export function FileViewer({
         shareRequest={shareRequest}
         downloadRequest={downloadRequest}
         slideNavRequest={slideNavRequest}
+        onSwitchFile={onSwitchFile}
       />
     );
   }
@@ -4433,6 +4457,7 @@ function HtmlViewer({
   shareRequest,
   downloadRequest,
   slideNavRequest,
+  onSwitchFile,
 }: {
   projectId: string;
   projectKind: TrackingProjectKind;
@@ -4454,6 +4479,7 @@ function HtmlViewer({
   shareRequest?: { nonce: number } | null;
   downloadRequest?: { nonce: number } | null;
   slideNavRequest?: { slideIndex: number; nonce: number } | null;
+  onSwitchFile?: (name: string) => void;
 }) {
   const { locale, t } = useI18n();
   const analytics = useAnalytics();
@@ -5298,6 +5324,8 @@ function HtmlViewer({
     [source],
   );
   const [urlSelectionBridgeReady, setUrlSelectionBridgeReady] = useState(false);
+  const lastPreviewRouteRef = useRef<PreviewRouteSnapshot | null>(null);
+  const pendingAnnotationActivationRef = useRef<PendingAnnotationActivation | null>(null);
   const urlLoadDecision: UrlLoadDecision = {
     mode,
     isDeck: effectiveDeck,
@@ -5312,7 +5340,7 @@ function HtmlViewer({
   };
   const useUrlLoadPreview = shouldUrlLoadHtmlPreview(urlLoadDecision) && !manualEditRequiresSrcDoc;
   const basePreviewSrcUrl = useMemo(
-    () => `${projectRawUrl(projectId, file.name)}?v=${Math.round(file.mtime)}&r=${reloadKey}&odPreviewBridge=scroll&odPreviewBridge=selection&odPreviewBridge=snapshot`,
+    () => `${projectRawUrl(projectId, file.name)}?v=${Math.round(file.mtime)}&r=${reloadKey}&odPreviewBridge=scroll&odPreviewBridge=selection&odPreviewBridge=snapshot&odPreviewBridge=route`,
     [projectId, file.name, file.mtime, reloadKey],
   );
   const [previewSrcUrl, setPreviewSrcUrl] = useState(basePreviewSrcUrl);
@@ -5359,6 +5387,23 @@ function HtmlViewer({
     setCommentCreateMode(false);
     setActivePreviewCommentId(null);
   }, [projectId, file.name]);
+  // Drop the cached sub-page route on file switch so a stale report from the
+  // previous artifact can't leak into the next file's activation.
+  useEffect(() => {
+    lastPreviewRouteRef.current = null;
+  }, [projectId, file.name]);
+  // After `maybeDeferAnnotationForRoute` asked the workspace to swap files,
+  // finish the deferred activation once the swap lands.
+  useEffect(() => {
+    const pending = pendingAnnotationActivationRef.current;
+    if (!pending || pending.file !== file.name) return;
+    pendingAnnotationActivationRef.current = null;
+    if (pending.kind === 'edit') performManualEditActivation();
+    else if (pending.kind === 'comment') performCommentActivation();
+    else if (pending.kind === 'commentCreate') performCommentCreateActivation();
+    else if (pending.kind === 'draw') performDrawActivation();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [file.name]);
   const activePreviewSrcUrl = (
     previewSrcUrl === effectiveBasePreviewSrcUrl ||
     previewSrcUrl.startsWith(`${effectiveBasePreviewSrcUrl}&`)
@@ -5467,6 +5512,32 @@ function HtmlViewer({
       const data = ev.data as { type?: string } | null;
       if (data?.type !== 'od:url-selection-bridge-ready') return;
       setUrlSelectionBridgeReady(true);
+    }
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, []);
+  // Track sub-page navigations reported by the daemon route bridge so we can
+  // recover the user's position when an activation forces a transport flip.
+  useEffect(() => {
+    function onMessage(ev: MessageEvent) {
+      const frame = urlPreviewIframeRef.current;
+      if (ev.source !== frame?.contentWindow) return;
+      if (frame.getAttribute('src') === 'about:blank') return;
+      const data = ev.data as
+        | { type?: string; href?: string; path?: string; hash?: string; search?: string }
+        | null;
+      if (!data || data.type !== 'od:preview-route') return;
+      const href = typeof data.href === 'string' ? data.href : '';
+      if (!href) return;
+      const file = typeof data.path === 'string' && data.path
+        ? parseFileFromRawPath(data.path)
+        : undefined;
+      lastPreviewRouteRef.current = {
+        href,
+        file,
+        hash: typeof data.hash === 'string' ? data.hash : undefined,
+        search: typeof data.search === 'string' ? data.search : undefined,
+      };
     }
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
@@ -5590,6 +5661,29 @@ function HtmlViewer({
   useEffect(() => {
     restorePreviewScrollPosition();
   }, [boardMode, drawOverlayOpen, manualEditMode, srcDoc, restorePreviewScrollPosition]);
+
+  // Replay a saved hash route onto the freshly built srcDoc iframe so a
+  // transport flip preserves the user's in-page anchor.
+  useEffect(() => {
+    if (useUrlLoadPreview) return;
+    const route = lastPreviewRouteRef.current;
+    if (!route?.hash) return;
+    if (route.file && route.file !== file.name) return;
+    const hash = route.hash;
+    const send = () => {
+      const win = iframeRef.current?.contentWindow;
+      if (!win) return;
+      win.postMessage({ type: 'od:preview-route-restore', hash }, '*');
+    };
+    const raf = window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        send();
+        window.setTimeout(send, 120);
+      });
+    });
+    return () => window.cancelAnimationFrame(raf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [useUrlLoadPreview, file.name, srcDoc]);
 
   useEffect(() => {
     function onMessage(ev: MessageEvent) {
@@ -7189,6 +7283,69 @@ function HtmlViewer({
     setAgentToolsOpen(false);
   }
 
+  function performDrawActivation() {
+    setCommentPanelOpen(false);
+    setCommentCreateMode(false);
+    setBoardMode(false);
+    clearBoardComposer();
+    setInspectMode(false);
+    setMode('preview');
+    setDrawOverlayOpen(true);
+    closeArtifactToolMenus();
+  }
+
+  function performCommentActivation() {
+    setCommentPanelOpen(false);
+    setCommentCreateMode(false);
+    clearBoardComposer();
+    setInspectMode(false);
+    setDrawOverlayOpen(false);
+    setMode('preview');
+    activateBoard('inspect');
+    closeArtifactToolMenus();
+  }
+
+  function performCommentCreateActivation() {
+    setCommentPanelOpen(true);
+    setCommentSidePanelCollapsed(false);
+    setCommentCreateMode(true);
+    if (!activeCommentTarget) clearBoardComposer();
+    setInspectMode(false);
+    setDrawOverlayOpen(false);
+    setMode('preview');
+    activateBoard('inspect');
+    closeArtifactToolMenus();
+  }
+
+  function performManualEditActivation() {
+    setCommentPanelOpen(false);
+    setCommentCreateMode(false);
+    setBoardMode(false);
+    clearBoardComposer();
+    setInspectMode(false);
+    setDrawOverlayOpen(false);
+    setMode('preview');
+    setManualEditViewportWidth(previewBodyRef.current?.clientWidth ?? null);
+    setManualEditSrcDocActive(true);
+    setManualEditMode(true);
+    closeArtifactToolMenus();
+  }
+
+  // If the iframe has navigated to a sub-page that differs from the active
+  // file tab, flip the active file first so the srcDoc rebuild lands on the
+  // page the user was viewing; otherwise the immediate activation would
+  // rebuild from the wrong source. Returns true when deferred.
+  function maybeDeferAnnotationForRoute(kind: PendingAnnotationActivation['kind']): boolean {
+    const route = lastPreviewRouteRef.current;
+    if (!route?.file) return false;
+    if (route.file === file.name) return false;
+    if (typeof onSwitchFile !== 'function') return false;
+    pendingAnnotationActivationRef.current = { file: route.file, kind };
+    onSwitchFile(route.file);
+    closeArtifactToolMenus();
+    return true;
+  }
+
   function activateDrawTool() {
     fireArtifactToolbarClick('mark');
     const next = !drawOverlayOpen;
@@ -7198,23 +7355,16 @@ function HtmlViewer({
       return;
     }
     capturePreviewScrollPosition();
-    const activateDraw = () => {
-      setCommentPanelOpen(false);
-      setCommentCreateMode(false);
-      setBoardMode(false);
-      clearBoardComposer();
-      setInspectMode(false);
-      setMode('preview');
-      setDrawOverlayOpen(true);
-      closeArtifactToolMenus();
-    };
     if (manualEditMode) {
       void exitManualEditModeAfterFlush().then((ok) => {
-        if (ok) activateDraw();
+        if (!ok) return;
+        if (maybeDeferAnnotationForRoute('draw')) return;
+        performDrawActivation();
       });
       return;
     }
-    activateDraw();
+    if (maybeDeferAnnotationForRoute('draw')) return;
+    performDrawActivation();
   }
 
   function activateCommentTool() {
@@ -7227,23 +7377,16 @@ function HtmlViewer({
       setAgentToolsOpen(false);
       return;
     }
-    const activateComment = () => {
-      setCommentPanelOpen(false);
-      setCommentCreateMode(false);
-      clearBoardComposer();
-      setInspectMode(false);
-      setDrawOverlayOpen(false);
-      setMode('preview');
-      activateBoard('inspect');
-      closeArtifactToolMenus();
-    };
     if (manualEditMode) {
       void exitManualEditModeAfterFlush().then((ok) => {
-        if (ok) activateComment();
+        if (!ok) return;
+        if (maybeDeferAnnotationForRoute('comment')) return;
+        performCommentActivation();
       });
       return;
     }
-    activateComment();
+    if (maybeDeferAnnotationForRoute('comment')) return;
+    performCommentActivation();
   }
 
   function activateCommentCreateTool() {
@@ -7257,41 +7400,24 @@ function HtmlViewer({
       closeArtifactToolMenus();
       return;
     }
-    const activateCommentCreate = () => {
-      setCommentPanelOpen(true);
-      setCommentSidePanelCollapsed(false);
-      setCommentCreateMode(true);
-      if (!activeCommentTarget) clearBoardComposer();
-      setInspectMode(false);
-      setDrawOverlayOpen(false);
-      setMode('preview');
-      activateBoard('inspect');
-      closeArtifactToolMenus();
-    };
     if (manualEditMode) {
       void exitManualEditModeAfterFlush().then((ok) => {
-        if (ok) activateCommentCreate();
+        if (!ok) return;
+        if (maybeDeferAnnotationForRoute('commentCreate')) return;
+        performCommentCreateActivation();
       });
       return;
     }
-    activateCommentCreate();
+    if (maybeDeferAnnotationForRoute('commentCreate')) return;
+    performCommentCreateActivation();
   }
 
   function activateManualEditTool() {
     fireArtifactToolbarClick('edit');
     capturePreviewScrollPosition();
     if (!manualEditMode) {
-      setCommentPanelOpen(false);
-      setCommentCreateMode(false);
-      setBoardMode(false);
-      clearBoardComposer();
-      setInspectMode(false);
-      setDrawOverlayOpen(false);
-      setMode('preview');
-      setManualEditViewportWidth(previewBodyRef.current?.clientWidth ?? null);
-      setManualEditSrcDocActive(true);
-      setManualEditMode(true);
-      closeArtifactToolMenus();
+      if (maybeDeferAnnotationForRoute('edit')) return;
+      performManualEditActivation();
       return;
     }
     closeArtifactToolMenus();
